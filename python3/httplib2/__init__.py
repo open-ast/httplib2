@@ -923,8 +923,8 @@ class HTTPSConnectionWithTimeout(http.client.HTTPSConnection):
             host = self.host
             port = self.port
 
-
         address_info = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+
         for family, socktype, proto, canonname, sockaddr in address_info:
             try:
                 if use_proxy:
@@ -960,6 +960,13 @@ class HTTPSConnectionWithTimeout(http.client.HTTPSConnection):
                         raise CertificateHostnameMismatch(
                             'Server presented certificate that does not match '
                             'host %s: %s' % (hostname, cert), hostname, cert)
+
+            except Exception as err:
+                msg = err
+                if use_proxy and isinstance(err, socks.ProxyError):
+                    pass
+                else:
+                    raise
             except ssl.SSLError as e:
                 if sock:
                     sock.close()
