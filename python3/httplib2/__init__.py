@@ -910,92 +910,84 @@ class HTTPSConnectionWithTimeout(http.client.HTTPSConnection):
 
     def connect(self):
         "Connect to a host on a given (SSL) port."
+        use_proxy = False
         msg = "getaddrinfo returns an empty list"
         if socks and self.proxy_info and self.proxy_info.isgood():
             use_proxy = True
             proxy_type, proxy_host, proxy_port, proxy_rdns, proxy_user, proxy_pass, proxy_headers = self.proxy_info.astuple()
-
             host = proxy_host
             port = proxy_port
-        else:
-            use_proxy = False
 
+        else:
             host = self.host
             port = self.port
 
-        address_info = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
-
-        for family, socktype, proto, canonname, sockaddr in address_info:
-            try:
-                if use_proxy:
+        if use_proxy:
+            address_info = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+            for family, socktype, proto, canonname, sockaddr in address_info:
+                try:
                     sock = socks.socksocket(family, socktype, proto)
-
                     sock.setproxy(proxy_type, proxy_host, proxy_port, proxy_rdns, proxy_user, proxy_pass)
-                else:
-                    sock = socket.socket(family, socktype, proto)
-                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    if has_timeout(self.timeout):
+                        sock.settimeout(self.timeout)
 
-                if has_timeout(self.timeout):
-                    sock.settimeout(self.timeout)
+                    sock.connect((self.host, self.port))
+                    self.sock =_ssl_wrap_socket(
+                        sock,
+                        keyfile=self.key_file,
+                        certfile=self.cert_file,
+                        ca_certs=self.ca_certs,
+                        ssl_version=self.ssl_version)
 
-                sock.connect((self.host, self.port))
-                self.sock =_ssl_wrap_socket(
-                    sock,
-                    keyfile=self.key_file,
-                    certfile=self.cert_file,
-                    ca_certs=self.ca_certs,
-                    ssl_version=self.ssl_version)
-
-                if self.debuglevel > 0:
-                    print("connect: (%s, %s)" % (host, port))
-                    if use_proxy:
+                    if self.debuglevel > 0:
+                        print("connect: (%s, %s)" % (host, port))
                         print("proxy: %s" % str((proxy_host, proxy_port, proxy_rdns, proxy_user, proxy_pass, proxy_headers)))
 
-                if not self.disable_ssl_certificate_validation:
-                    # TODO: DEBUG this part
-                    # TODO: here we always get an empty `certs` dict
-                    cert = self.sock.getpeercert()
-                    hostname = self.host.split(':', 0)[0]
-                    if not self._ValidateCertificateHostname(cert, hostname):
-                        raise CertificateHostnameMismatch(
-                            'Server presented certificate that does not match '
-                            'host %s: %s' % (hostname, cert), hostname, cert)
+                    if not self.disable_ssl_certificate_validation:
+                        # TODO: DEBUG this part
+                        # TODO: here we always get an empty `certs` dict
+                        cert = self.sock.getpeercert()
+                        hostname = self.host.split(':', 0)[0]
+                        if not self._ValidateCertificateHostname(cert, hostname):
+                            raise CertificateHostnameMismatch(
+                                'Server presented certificate that does not match '
+                                'host %s: %s' % (hostname, cert), hostname, cert)
 
-            except Exception as err:
-                msg = err
-                if use_proxy and isinstance(err, socks.ProxyError):
-                    pass
-                else:
+                except Exception as err:
+                    msg = err
+                    if isinstance(err, socks.ProxyError):
+                        pass
+                    else:
+                        raise
+                except ssl.SSLError as e:
+                    if sock:
+                        sock.close()
+                    if self.sock:
+                        self.sock.close()
+                        self.sock = None
+                        # Unfortunately the ssl module doesn't seem to provide any way
+                        # to get at more detailed error information, in particular
+                        # whether the error is due to certificate validation or
+                        # something else (such as SSL protocol mismatch).
+                    if e.errno == ssl.SSL_ERROR_SSL:
+                        raise SSLHandshakeError(e)
+                    else:
+                        raise
+                except (socket.timeout, socket.gaierror):
                     raise
-            except ssl.SSLError as e:
-                if sock:
-                    sock.close()
-                if self.sock:
-                    self.sock.close()
-                self.sock = None
-                # Unfortunately the ssl module doesn't seem to provide any way
-                # to get at more detailed error information, in particular
-                # whether the error is due to certificate validation or
-                # something else (such as SSL protocol mismatch).
-                if e.errno == ssl.SSL_ERROR_SSL:
-                    raise SSLHandshakeError(e)
-                else:
-                    raise
-            except (socket.timeout, socket.gaierror):
-                raise
-            except socket.error as msg:
-                if self.debuglevel > 0:
-                    print("connect fail: (%s, %s)" % (self.host, self.port))
-                    if use_proxy:
+                except socket.error as msg:
+                    if self.debuglevel > 0:
+                        print("connect fail: (%s, %s)" % (self.host, self.port))
                         print("proxy: %s" % str((proxy_host, proxy_port, proxy_rdns, proxy_user, proxy_pass, proxy_headers)))
-                if self.sock:
-                    self.sock.close()
-                self.sock = None
-                continue
-            break
-        if not self.sock:
-            raise socket.error(msg)
-
+                    if self.sock:
+                        self.sock.close()
+                        self.sock = None
+                    continue
+                break
+            if not self.sock:
+                raise socket.error(msg)
+        else:
+            return super().connect()
 
 SCHEME_TO_CONNECTION = {
     'http': HTTPConnectionWithTimeout,
@@ -1318,6 +1310,8 @@ a string that contains the response entity body.
                 scheme = 'https'
                 authority = domain_port[0]
 
+            proxy_info = self._get_proxy_info(scheme, authority)
+
             conn_key = scheme+":"+authority
             if conn_key in self.connections:
                 conn = self.connections[conn_key]
@@ -1330,14 +1324,14 @@ a string that contains the response entity body.
                         conn = self.connections[conn_key] = connection_type(
                                 authority, key_file=certs[0][0],
                                 cert_file=certs[0][1], timeout=self.timeout,
-                                proxy_info=self.proxy_info,
+                                proxy_info=proxy_info,
                                 ca_certs=self.ca_certs,
                                 disable_ssl_certificate_validation=
                                         self.disable_ssl_certificate_validation)
                     else:
                         conn = self.connections[conn_key] = connection_type(
                                 authority, timeout=self.timeout,
-                                proxy_info=self.proxy_info,
+                                proxy_info=proxy_info,
                                 ca_certs=self.ca_certs,
                                 disable_ssl_certificate_validation=
                                         self.disable_ssl_certificate_validation)
@@ -1485,8 +1479,22 @@ a string that contains the response entity body.
             else:
                 raise
 
-
         return (response, content)
+
+    def _get_proxy_info(self, scheme, authority):
+        """Return a ProxyInfo instance (or None) based on the scheme
+        and authority.
+        """
+        hostname, port = urllib.parse.splitport(authority)
+        proxy_info = self.proxy_info
+        if callable(proxy_info):
+            proxy_info = proxy_info(scheme)
+
+        if (hasattr(proxy_info, 'applies_to')
+            and not proxy_info.applies_to(hostname)):
+            proxy_info = None
+        return proxy_info
+
 
 
 
